@@ -1,0 +1,13 @@
+{
+  "functions": {
+    "pages/api/analyze-links.js": {
+      "maxDuration": 60
+    },
+    "pages/api/target-page.js": {
+      "maxDuration": 60
+    },
+    "pages/api/crawl-sitemap.js": {
+      "maxDuration": 30
+    }
+  }
+}
