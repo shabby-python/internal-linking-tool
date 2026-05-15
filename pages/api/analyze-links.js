@@ -29,7 +29,9 @@ import {
 } from '../../lib/analyzer.js';
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const FETCH_TIMEOUT_MS = 15000;
+const FETCH_TIMEOUT_MS = 30000;  // v4: raised to 30s
+const MAX_RETRIES      = 1;      // v4: retry once on timeout/network error
+const CONCURRENCY      = 4;      // v4: max parallel fetches
 const MAX_URLS_PER_REQ = 60;
 
 const FETCH_HEADERS = {
@@ -41,6 +43,23 @@ const FETCH_HEADERS = {
   'Cache-Control': 'no-cache',
   'Upgrade-Insecure-Requests': '1',
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  CONTROLLED CONCURRENCY  (v4)
+// ─────────────────────────────────────────────────────────────────────────────
+async function concurrentMap(items, fn, concurrency = CONCURRENCY) {
+  const results = [];
+  let i = 0;
+  async function worker() {
+    while (i < items.length) {
+      const idx = i++;
+      results[idx] = await fn(items[idx]);
+    }
+  }
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, worker);
+  await Promise.allSettled(workers);
+  return results;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  MAIN HANDLER
@@ -103,9 +122,11 @@ export default async function handler(req, res) {
     }
   }
 
-  // ── Fetch all pages in parallel (server-side — no CORS) ───────────────────
-  const fetchResults = await Promise.all(
-    toFetch.map(url => fetchAndProcess(url, settings))
+  // ── Fetch all pages (controlled concurrency, Promise.allSettled) ─────────
+  const fetchResults = await concurrentMap(
+    toFetch,
+    url => fetchAndProcess(url, settings),
+    CONCURRENCY
   );
 
   // Separate into fetch log and successful page data
@@ -315,18 +336,19 @@ async function fetchAndProcess(url, settings = {}) {
     h1,
     headings,
     paragraphs,
-    paragraphPositions,   // parallel array of relative positions 0–1
-    existingLinks:        [...existingLinkSet],
+    paragraphPositions,
+    existingLinks:       [...existingLinkSet],
     keywords,
     topics,
     pageType,
     extractionMethod,
     confidence,
-    wordCount:            fullText.split(/\s+/).length,
-    paragraphCount:       paragraphs.length,
-    inboundCount:         0,    // filled in later
-    isOrphan:             false,
-    error:                false,
+    wordCount:           fullText.split(/\s+/).length,
+    paragraphCount:      paragraphs.length,
+    sourceType:          'main-body',  // v4: real body content only
+    inboundCount:        0,
+    isOrphan:            false,
+    error:               false,
   };
 
   return {
@@ -339,18 +361,14 @@ async function fetchAndProcess(url, settings = {}) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  RAW HTTP FETCH  (server-side — no CORS)
+//  RAW HTTP FETCH  (v4: 30s timeout, retry once on timeout/network error)
 // ─────────────────────────────────────────────────────────────────────────────
-async function fetchURL(url) {
+async function fetchURL(url, attempt = 0) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
   try {
-    const res = await fetch(url, {
-      signal:   controller.signal,
-      headers:  FETCH_HEADERS,
-      redirect: 'follow',
-    });
+    const res = await fetch(url, { signal: controller.signal, headers: FETCH_HEADERS, redirect: 'follow' });
     clearTimeout(timer);
 
     const ct = (res.headers.get('content-type') || '').toLowerCase();
@@ -363,48 +381,35 @@ async function fetchURL(url) {
         500: 'Server error (500)',
         503: 'Service unavailable (503)',
       };
-      return {
-        success: false,
-        status:  `failed:http-${res.status}`,
-        message: `✗ Failed: ${statusMap[res.status] || `HTTP ${res.status}`}`,
-      };
+      return { success: false, status: `failed:http-${res.status}`, message: `✗ Failed: ${statusMap[res.status] || `HTTP ${res.status}`}` };
     }
 
     if (!ct.includes('html') && !ct.includes('text')) {
       return {
-        success: false,
-        status:  'skipped:non-html',
+        success: false, status: 'skipped:non-html',
         message: `⊘ Skipped: non-HTML response (Content-Type: ${ct})`,
         skipped: { url, reason: 'non-html', details: `Content-Type was "${ct}"` },
       };
     }
 
     const html = await res.text();
-    if (!html || html.trim().length < 300) {
-      return {
-        success: false,
-        status:  'failed:empty-response',
-        message: '✗ Failed: Response body too short or empty',
-      };
-    }
+    if (!html || html.trim().length < 300)
+      return { success: false, status: 'failed:empty-response', message: '✗ Failed: Response body too short or empty' };
 
     return { success: true, html };
 
   } catch (err) {
     clearTimeout(timer);
-    if (err.name === 'AbortError')
-      return { success: false, status: 'failed:timeout',  message: `✗ Failed: Timeout after ${FETCH_TIMEOUT_MS / 1000}s` };
-    if (err.code === 'ECONNREFUSED')
-      return { success: false, status: 'failed:refused',  message: '✗ Failed: Connection refused' };
-    if (err.code === 'ENOTFOUND')
-      return { success: false, status: 'failed:dns',      message: '✗ Failed: Domain not found (DNS lookup failed)' };
-    if (err.code === 'CERT_HAS_EXPIRED')
-      return { success: false, status: 'failed:ssl',      message: '✗ Failed: SSL certificate error' };
-    return {
-      success: false,
-      status:  'failed:error',
-      message: `✗ Failed: ${err.message}`,
-    };
+    const isRetryable = err.name === 'AbortError' || err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT';
+    if (isRetryable && attempt < MAX_RETRIES) {
+      await new Promise(r => setTimeout(r, 1500));
+      return fetchURL(url, attempt + 1);
+    }
+    if (err.name === 'AbortError')       return { success: false, status: 'failed:timeout',  message: `✗ Failed: Timeout after ${FETCH_TIMEOUT_MS / 1000}s` };
+    if (err.code === 'ECONNREFUSED')     return { success: false, status: 'failed:refused',  message: '✗ Failed: Connection refused' };
+    if (err.code === 'ENOTFOUND')        return { success: false, status: 'failed:dns',      message: '✗ Failed: Domain not found (DNS lookup failed)' };
+    if (err.code === 'CERT_HAS_EXPIRED') return { success: false, status: 'failed:ssl',      message: '✗ Failed: SSL certificate error' };
+    return { success: false, status: 'failed:error', message: `✗ Failed: ${err.message}` };
   }
 }
 

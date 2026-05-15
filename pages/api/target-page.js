@@ -35,8 +35,10 @@ import { fetchSitemapURLs } from '../../lib/sitemap.js';
 import { findBestAnchor, classifyAnchorType, getAnchorContext } from '../../lib/anchor.js';
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const FETCH_TIMEOUT_MS    = 15000;
-const MAX_CANDIDATE_URLS  = 500;   // v3.1: raised from 80
+const FETCH_TIMEOUT_MS    = 30000;  // v4: raised to 30s
+const MAX_RETRIES         = 1;      // v4: retry once on timeout/network error
+const CONCURRENCY         = 4;      // v4: max parallel fetches
+const MAX_CANDIDATE_URLS  = 500;
 const DEFAULT_SITEMAP_MAX = 500;
 
 const FETCH_HEADERS = {
@@ -48,6 +50,23 @@ const FETCH_HEADERS = {
   'Cache-Control': 'no-cache',
   'Upgrade-Insecure-Requests': '1',
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  CONTROLLED CONCURRENCY  (v4)
+// ─────────────────────────────────────────────────────────────────────────────
+async function concurrentMap(items, fn, concurrency = CONCURRENCY) {
+  const results = [];
+  let i = 0;
+  async function worker() {
+    while (i < items.length) {
+      const idx = i++;
+      results[idx] = await fn(items[idx]);
+    }
+  }
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, worker);
+  await Promise.allSettled(workers);
+  return results;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  MAIN HANDLER
@@ -167,9 +186,11 @@ export default async function handler(req, res) {
     });
   }
 
-  // ── Step 3: Fetch candidate pages (with thin-content fallback) ─────────────
-  const fetchResults = await Promise.all(
-    resolvedCandidates.map(url => fetchAndProcess(url, settings, false))
+  // ── Step 3: Fetch candidate pages (controlled concurrency, no fallback) ─────
+  const fetchResults = await concurrentMap(
+    resolvedCandidates,
+    url => fetchAndProcess(url, settings, false),
+    CONCURRENCY
   );
 
   const fetchLog = fetchResults.map(r => ({
@@ -189,7 +210,7 @@ export default async function handler(req, res) {
 
   diag.fetchedPages     = sourcePages.length;
   diag.skippedPages     = fetchResults.filter(r => !r.success).length;
-  diag.thinContentPages = sourcePages.filter(p => p.thinContent).length;
+  diag.noBodyContent    = fetchResults.filter(r => r.status === 'skipped:no-body-content').length;
 
   // ── Step 4: All pages = sources + target ──────────────────────────────────
   const allPages = [...sourcePages, targetPage];
@@ -524,37 +545,18 @@ async function fetchAndProcess(url, settings = {}, isTarget = false) {
       extraIncludeSelectors: settings.includeSelectors  || '',
     });
 
-  // ── Thin content fallback (v3.1) ──────────────────────────────────────────
-  // Instead of skipping, we build pseudo-paragraphs from structural signals.
-  let finalParagraphs         = paragraphs;
-  let finalParagraphPositions = paragraphPositions;
-  let thinContent             = false;
-
-  if (paragraphs.length < 2) {
-    thinContent = true;
-    const h2s = headings.filter(h => h.level === 'H2').map(h => h.text).filter(Boolean);
-    const h3s = headings.filter(h => h.level === 'H3').map(h => h.text).filter(Boolean);
-
-    // Build pseudo-paragraphs from available metadata
-    const pseudos = [
-      title    ? `${title}.` : null,
-      metaDesc ? metaDesc    : null,
-      h1       ? `${h1}.`   : null,
-      ...h2s.map(h => `${h}.`),
-      ...h3s.map(h => `${h}.`),
-      // Also extract URL slug words as a pseudo sentence
-      (() => {
-        try {
-          const slug = new URL(url).pathname.replace(/[/-]/g, ' ').trim();
-          return slug.length > 5 ? `Topics covered: ${slug}.` : null;
-        } catch { return null; }
-      })(),
-    ].filter(Boolean);
-
-    if (pseudos.length > 0) {
-      finalParagraphs         = pseudos;
-      finalParagraphPositions = pseudos.map((_, i) => i / Math.max(pseudos.length - 1, 1));
-    }
+  // ── Thin content: hard skip — no fallback to title/meta/headings (v4) ───────
+  // Internal links can only be inserted into real visible body content.
+  // If no body paragraphs exist, skip this page entirely.
+  if (!isTarget && paragraphs.length < 2) {
+    return {
+      url, success: false, status: 'skipped:no-body-content',
+      message: `⊘ Skipped: only ${paragraphs.length} body paragraph(s) extracted — no valid main-body content. Cannot suggest links from this page.`,
+      skipped: {
+        url, reason: 'no-body-content',
+        details: `Extracted ${paragraphs.length} paragraph(s) via "${extractionMethod}" (${Math.round(confidence * 100)}% confidence). No fallback to title/meta/headings — internal links require real body text.`,
+      },
+    };
   }
 
   // Internal links
@@ -570,46 +572,41 @@ async function fetchAndProcess(url, settings = {}, isTarget = false) {
     } catch {}
   });
 
-  const fullText = [title, metaDesc, h1, ...headings.map(h => h.text), ...finalParagraphs].join(' ');
+  const fullText = [title, metaDesc, h1, ...headings.map(h => h.text), ...paragraphs].join(' ');
   const keywords = extractKeywords(fullText);
   const topics   = extractTopics(title, h1, headings, metaDesc);
   const pageType = detectPageType(url, title);
 
-  const msg = thinContent
-    ? `⚠ Limited content (${finalParagraphs.length} pseudo-paragraphs from title/meta/headings) — still scoring semantically`
-    : `✓ Fetched — ${finalParagraphs.length} paragraphs via "${extractionMethod}" (${Math.round(confidence*100)}% confidence)`;
-
   return {
     url,
-    success:     true,
-    status:      'success',
-    message:     msg,
-    thinContent,
+    success: true,
+    status:  'success',
+    message: `✓ Fetched — ${paragraphs.length} body paragraphs via "${extractionMethod}" (${Math.round(confidence * 100)}% confidence)`,
     pageData: {
       url,
       normalizedURL:       normalizeURL(url),
       title:               title || url,
       metaDesc, h1, headings,
-      paragraphs:          finalParagraphs,
-      paragraphPositions:  finalParagraphPositions,
+      paragraphs,
+      paragraphPositions,
       existingLinks:       [...existingLinkSet],
       keywords, topics, pageType,
-      extractionMethod:    thinContent ? 'thin-content-fallback' : extractionMethod,
-      confidence:          thinContent ? 0.4 : confidence,
-      wordCount:           fullText.split(/\s+/).length,
-      paragraphCount:      finalParagraphs.length,
-      thinContent,
-      inboundCount: 0,
-      isOrphan:     false,
-      error:        false,
+      extractionMethod,
+      confidence,
+      wordCount:       fullText.split(/\s+/).length,
+      paragraphCount:  paragraphs.length,
+      sourceType:      'main-body',  // v4: always real body content
+      inboundCount:    0,
+      isOrphan:        false,
+      error:           false,
     },
   };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  RAW HTTP FETCH
+//  RAW HTTP FETCH  (v4: 30s timeout, retry once on timeout/network error)
 // ─────────────────────────────────────────────────────────────────────────────
-async function fetchURL(url) {
+async function fetchURL(url, attempt = 0) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {
@@ -617,20 +614,26 @@ async function fetchURL(url) {
     clearTimeout(timer);
     const ct = (res.headers.get('content-type') || '').toLowerCase();
     if (!res.ok) {
-      const m = { 403:'Access forbidden', 404:'Not found', 429:'Rate limited', 500:'Server error', 503:'Unavailable' };
-      return { success: false, status: `failed:http-${res.status}`, message: `✗ ${m[res.status]||`HTTP ${res.status}`}` };
+      const m = { 403:'Access forbidden', 404:'Not found', 429:'Rate limited — too many requests', 500:'Server error', 503:'Service unavailable' };
+      return { success: false, status: `failed:http-${res.status}`, message: `✗ Failed: ${m[res.status] || `HTTP ${res.status}`}` };
     }
     if (!ct.includes('html') && !ct.includes('text'))
-      return { success: false, status: 'skipped:non-html', message: `⊘ Non-HTML (${ct})` };
+      return { success: false, status: 'skipped:non-html', message: `⊘ Skipped: non-HTML response (${ct})` };
     const html = await res.text();
     if (!html || html.trim().length < 100)
-      return { success: false, status: 'failed:empty', message: '✗ Empty response' };
+      return { success: false, status: 'failed:empty', message: '✗ Failed: Empty response' };
     return { success: true, html };
   } catch (err) {
     clearTimeout(timer);
-    if (err.name === 'AbortError') return { success: false, status: 'failed:timeout', message: `✗ Timeout after ${FETCH_TIMEOUT_MS/1000}s` };
-    if (err.code === 'ECONNREFUSED') return { success: false, status: 'failed:refused', message: '✗ Connection refused' };
-    if (err.code === 'ENOTFOUND')    return { success: false, status: 'failed:dns',     message: '✗ Domain not found' };
-    return { success: false, status: 'failed:error', message: `✗ ${err.message}` };
+    const isRetryable = err.name === 'AbortError' || err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT';
+    if (isRetryable && attempt < MAX_RETRIES) {
+      await new Promise(r => setTimeout(r, 1500)); // brief pause before retry
+      return fetchURL(url, attempt + 1);
+    }
+    if (err.name === 'AbortError')       return { success: false, status: 'failed:timeout',  message: `✗ Failed: Timeout after ${FETCH_TIMEOUT_MS/1000}s` };
+    if (err.code === 'ECONNREFUSED')     return { success: false, status: 'failed:refused',  message: '✗ Failed: Connection refused' };
+    if (err.code === 'ENOTFOUND')        return { success: false, status: 'failed:dns',      message: '✗ Failed: Domain not found' };
+    if (err.code === 'CERT_HAS_EXPIRED') return { success: false, status: 'failed:ssl',      message: '✗ Failed: SSL certificate error' };
+    return { success: false, status: 'failed:error', message: `✗ Failed: ${err.message}` };
   }
 }
