@@ -353,7 +353,7 @@ function processHTML(url, html, settings, isRendered) {
     extractionMethod,
     confidence,
   } = extractMainContent($, {
-    minParagraphWords:     settings.minParagraphWords || 15,
+    minParagraphWords:     settings.minParagraphWords || 10,
     extraExcludeSelectors: settings.excludeSelectors  || '',
     extraIncludeSelectors: settings.includeSelectors  || '',
   });
