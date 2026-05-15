@@ -547,14 +547,22 @@ async function fetchAndProcess(url, settings = {}, isTarget = false) {
 
   // ── Thin content: hard skip — no fallback to title/meta/headings (v4) ───────
   // Internal links can only be inserted into real visible body content.
-  // If no body paragraphs exist, skip this page entirely.
-  if (!isTarget && paragraphs.length < 2) {
+  // Require at least 1 real body paragraph. JS-rendered or truly empty pages
+  // (where the server returns an HTML shell with no text content) are skipped.
+  if (!isTarget && paragraphs.length < 1) {
+    // Detect likely JS-rendered pages: HTML exists but almost no visible text
+    const rawBodyText = ($('body').text() || '').replace(/\s+/g, ' ').trim();
+    const isJSRendered = rawBodyText.split(/\s+/).length < 80;
     return {
       url, success: false, status: 'skipped:no-body-content',
-      message: `⊘ Skipped: only ${paragraphs.length} body paragraph(s) extracted — no valid main-body content. Cannot suggest links from this page.`,
+      message: isJSRendered
+        ? `⊘ Skipped: page appears to be JavaScript-rendered (only ${rawBodyText.split(/\s+/).length} words in raw HTML). Content loads via JS and cannot be extracted server-side.`
+        : `⊘ Skipped: only ${paragraphs.length} body paragraph(s) extracted — no valid main-body content. Cannot suggest links from this page.`,
       skipped: {
-        url, reason: 'no-body-content',
-        details: `Extracted ${paragraphs.length} paragraph(s) via "${extractionMethod}" (${Math.round(confidence * 100)}% confidence). No fallback to title/meta/headings — internal links require real body text.`,
+        url, reason: isJSRendered ? 'js-rendered' : 'no-body-content',
+        details: isJSRendered
+          ? `Raw HTML body has ~${rawBodyText.split(/\s+/).length} words — likely a client-side rendered app. Extraction method: "${extractionMethod}" (${Math.round(confidence * 100)}% confidence).`
+          : `Extracted ${paragraphs.length} paragraph(s) via "${extractionMethod}" (${Math.round(confidence * 100)}% confidence). No fallback to title/meta/headings — internal links require real body text.`,
       },
     };
   }

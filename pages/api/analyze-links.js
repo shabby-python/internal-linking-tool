@@ -295,16 +295,22 @@ async function fetchAndProcess(url, settings = {}) {
   });
 
   // ── Check content thinness ────────────────────────────────────────────────
-  if (paragraphs.length < 2) {
+  if (paragraphs.length < 1) {
+    const rawBodyText = ($('body').text() || '').replace(/\s+/g, ' ').trim();
+    const isJSRendered = rawBodyText.split(/\s+/).length < 80;
     return {
       url,
       success: false,
-      status:  'skipped:thin-content',
-      message: `⊘ Skipped: only ${paragraphs.length} body paragraph(s) found — content too thin or extraction failed`,
+      status:  isJSRendered ? 'skipped:js-rendered' : 'skipped:thin-content',
+      message: isJSRendered
+        ? `⊘ Skipped: page appears JavaScript-rendered (~${rawBodyText.split(/\s+/).length} words in raw HTML). Content loads via JS and cannot be extracted server-side.`
+        : `⊘ Skipped: only ${paragraphs.length} body paragraph(s) found — content too thin or extraction failed`,
       skipped: {
         url,
-        reason:  'thin-content',
-        details: `Extracted ${paragraphs.length} paragraphs via "${extractionMethod}" (confidence ${Math.round(confidence * 100)}%)`,
+        reason:  isJSRendered ? 'js-rendered' : 'thin-content',
+        details: isJSRendered
+          ? `Raw HTML body has ~${rawBodyText.split(/\s+/).length} words — client-side rendered app. Extraction: "${extractionMethod}" (${Math.round(confidence * 100)}% confidence).`
+          : `Extracted ${paragraphs.length} paragraphs via "${extractionMethod}" (confidence ${Math.round(confidence * 100)}%)`,
       },
     };
   }
