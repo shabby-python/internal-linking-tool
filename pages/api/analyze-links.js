@@ -1,19 +1,16 @@
 /**
- * pages/api/analyze-links.js
+ * pages/api/analyze-links.js — v4.3 Hybrid Extraction Pipeline
  * ─────────────────────────────────────────────────────────────────────────────
- * Server-side URL fetcher + content extractor + opportunity analyzer.
+ * Two-phase fetch:
+ *   Phase 1 — Raw HTTP fetch (concurrency: 5)
+ *     → Detect JS-rendered pages via word count + framework fingerprints
+ *     → Extract body content from SSR pages normally
+ *   Phase 2 — Playwright render (concurrency: 2, only for JS-detected pages)
+ *     → Render in headless Chromium, extract same body-only content
  *
- * All fetch calls happen here (Node.js), not in the browser.
- * This completely bypasses CORS — works for any website.
- *
- * Domain-agnostic: zero hardcoded brand names, URL paths, or selectors.
- *
- * v2 improvements:
- *  - paragraphPositions is stored in pageData and forwarded to the analyzer.
- *  - Cross-page boilerplate fingerprinting removes paragraphs that appear
- *    verbatim on 3+ pages (site-wide template text such as author bio
- *    templates or category intro blocks).
- *  - boilerplateRemovedCount included in summary for transparency.
+ * Body-only rule (unchanged):
+ *   Every opportunity comes from real visible <p> and <li> elements inside a
+ *   known main-content container. No title / meta / heading / JSON-LD fallback.
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
@@ -27,12 +24,20 @@ import {
   buildSummary,
   normalizeURL,
 } from '../../lib/analyzer.js';
+import {
+  isJSRendered,
+  openBrowser,
+  closeBrowser,
+  renderWithBrowser,
+} from '../../lib/renderer.js';
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const FETCH_TIMEOUT_MS = 30000;  // v4: raised to 30s
-const MAX_RETRIES      = 1;      // v4: retry once on timeout/network error
-const CONCURRENCY      = 4;      // v4: max parallel fetches
-const MAX_URLS_PER_REQ = 60;
+const FETCH_TIMEOUT_MS   = 30000;
+const RENDER_TIMEOUT_MS  = 45000;
+const MAX_RETRIES        = 1;
+const RAW_CONCURRENCY    = 5;
+const RENDER_CONCURRENCY = 2;
+const MAX_URLS_PER_REQ   = 60;
 
 const FETCH_HEADERS = {
   'User-Agent':
@@ -45,9 +50,9 @@ const FETCH_HEADERS = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  CONTROLLED CONCURRENCY  (v4)
+//  CONTROLLED CONCURRENCY
 // ─────────────────────────────────────────────────────────────────────────────
-async function concurrentMap(items, fn, concurrency = CONCURRENCY) {
+async function concurrentMap(items, fn, concurrency) {
   const results = [];
   let i = 0;
   async function worker() {
@@ -62,75 +67,6 @@ async function concurrentMap(items, fn, concurrency = CONCURRENCY) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  JINA AI READER FALLBACK
-//  Used when the server-fetched HTML has almost no visible text, meaning
-//  the page is JavaScript-rendered (React/Next.js CSR, etc.).
-//  Jina Reader (r.jina.ai) fetches and renders the page server-side and
-//  returns the content as clean markdown-style text — free, no API key.
-// ─────────────────────────────────────────────────────────────────────────────
-function escHtml(s) {
-  return String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-}
-
-async function fetchViaJina(url) {
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 22000);
-    const res = await fetch(`https://r.jina.ai/${url}`, {
-      signal: controller.signal,
-      headers: { 'Accept': 'text/plain', 'X-No-Cache': 'true' },
-    });
-    clearTimeout(timer);
-    if (!res.ok) return null;
-    const text = await res.text();
-    if (!text || text.trim().length < 150) return null;
-
-    // Parse Jina's plain-text / markdown output → simple HTML
-    const lines = text.split('\n').map(l => l.trim());
-    let title = '';
-    let inContent = false;
-    const body = [];
-
-    for (const line of lines) {
-      if (!line) continue;
-      if (line.startsWith('Title:'))          { title = line.slice(6).trim(); continue; }
-      if (line.startsWith('URL Source:') ||
-          line.startsWith('Published Time:') ||
-          line.startsWith('Warning:'))         { continue; }
-      if (line === 'Markdown Content:')        { inContent = true; continue; }
-      if (!inContent)                          { continue; }
-      if (line.startsWith('!') ||
-          line.startsWith('|'))               { continue; } // images / tables
-
-      if (line.startsWith('# ')) {
-        body.push(`<h1>${escHtml(line.slice(2))}</h1>`);
-      } else if (/^#{2,6} /.test(line)) {
-        const m = line.match(/^(#{2,6}) (.*)/);
-        if (m) body.push(`<h${m[1].length}>${escHtml(m[2])}</h${m[1].length}>`);
-      } else {
-        // Strip markdown formatting, keep text
-        const clean = line
-          .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
-          .replace(/\*{1,3}([^*]+)\*{1,3}/g, '$1')
-          .replace(/`([^`]+)`/g, '$1')
-          .trim();
-        if (clean.length > 20) body.push(`<p>${escHtml(clean)}</p>`);
-      }
-    }
-
-    if (body.length < 3) return null;
-
-    return `<html><head><title>${escHtml(title)}</title></head>` +
-           `<body><main>${body.join('\n')}</main></body></html>`;
-  } catch {
-    return null;
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 //  MAIN HANDLER
 // ─────────────────────────────────────────────────────────────────────────────
 export default async function handler(req, res) {
@@ -139,7 +75,6 @@ export default async function handler(req, res) {
 
   const { urls = [], settings = {} } = req.body || {};
 
-  // ── Validate ──────────────────────────────────────────────────────────────
   if (!Array.isArray(urls) || urls.length === 0)
     return res.status(400).json({ error: 'No URLs provided.' });
 
@@ -155,14 +90,10 @@ export default async function handler(req, res) {
       error: `Maximum ${MAX_URLS_PER_REQ} URLs per request. Please trim the list.`,
     });
 
-  // Validate URL format
-  const invalid = cleanURLs.filter(u => {
-    try { new URL(u); return false; } catch { return true; }
-  });
+  const invalid = cleanURLs.filter(u => { try { new URL(u); return false; } catch { return true; } });
   if (invalid.length)
     return res.status(400).json({ error: `Invalid URL(s): ${invalid.slice(0, 3).join(', ')}` });
 
-  // ── Check same domain ─────────────────────────────────────────────────────
   const domains = [...new Set(cleanURLs.map(u => {
     try { return new URL(u).hostname.replace(/^www\./, ''); } catch { return ''; }
   }).filter(Boolean))];
@@ -172,7 +103,7 @@ export default async function handler(req, res) {
       error: `All URLs must be from the same domain. Found: ${domains.join(', ')}`,
     });
 
-  // ── Deduplicate normalized URLs ────────────────────────────────────────────
+  // ── Deduplicate ───────────────────────────────────────────────────────────
   const normSeen = new Set();
   const skipped  = [];
   const toFetch  = [];
@@ -180,72 +111,120 @@ export default async function handler(req, res) {
   for (const url of cleanURLs) {
     const norm = normalizeURL(url);
     if (normSeen.has(norm)) {
-      skipped.push({
-        url,
-        reason: 'duplicate',
-        details: `Normalized duplicate of a previously seen URL (${norm})`,
-      });
+      skipped.push({ url, reason: 'duplicate', details: `Normalized duplicate of ${norm}` });
     } else {
       normSeen.add(norm);
       toFetch.push(url);
     }
   }
 
-  // ── Fetch all pages (controlled concurrency, Promise.allSettled) ─────────
-  const fetchResults = await concurrentMap(
+  // ─────────────────────────────────────────────────────────────────────────
+  //  PHASE 1 — Raw HTTP fetch (concurrency: 5)
+  // ─────────────────────────────────────────────────────────────────────────
+  const phase1 = await concurrentMap(
     toFetch,
-    url => fetchAndProcess(url, settings),
-    CONCURRENCY
+    url => rawFetchAndProcess(url, settings),
+    RAW_CONCURRENCY
   );
 
-  // Separate into fetch log and successful page data
-  const fetchLog = fetchResults.map(r => ({
-    url:          r.url,
-    success:      r.success,
-    status:       r.status,
-    message:      r.message,
-    redirectedTo: r.redirectedTo || null,
-  }));
+  // Partition results
+  const rawSuccess  = phase1.filter(r => r.success);
+  const needsRender = phase1.filter(r => r.jsDetected);
+  const rawFailed   = phase1.filter(r => !r.success && !r.jsDetected && !r.skipped);
+  const rawSkipped  = phase1.filter(r => r.skipped);
 
-  // Collect per-page skips (noindex, canonical mismatch, thin content)
-  fetchResults.forEach(r => {
-    if (r.skipped) skipped.push(r.skipped);
-  });
+  rawSkipped.forEach(r => skipped.push(r.skipped));
 
-  const pages = fetchResults.filter(r => r.success && r.pageData).map(r => r.pageData);
+  // ─────────────────────────────────────────────────────────────────────────
+  //  PHASE 2 — Playwright render (concurrency: 2, JS-detected pages only)
+  // ─────────────────────────────────────────────────────────────────────────
+  let renderSuccess = [];
+  let renderFailed  = [];
+  let renderNoBody  = [];
+  let browser       = null;
 
-  // ── Cross-page boilerplate fingerprinting ──────────────────────────────────
-  // Remove paragraphs that appear verbatim on 3+ pages (site-wide templates).
-  // This catches author bio templates, category intros, footer disclaimers, etc.
-  // that passed per-page extraction but are clearly site-wide boilerplate.
+  if (needsRender.length > 0) {
+    browser = await openBrowser();
+
+    if (browser) {
+      const phase2 = await concurrentMap(
+        needsRender,
+        r => renderAndProcess(r.url, settings, browser),
+        RENDER_CONCURRENCY
+      );
+      renderSuccess = phase2.filter(r => r.success);
+      renderFailed  = phase2.filter(r => !r.success && !r.noBody);
+      renderNoBody  = phase2.filter(r => r.noBody);
+    } else {
+      // Playwright not installed
+      renderFailed = needsRender.map(r => ({
+        url:     r.url,
+        success: false,
+        status:  'failed:render-unavailable',
+        message: '✗ Playwright not available — run: npm install playwright',
+      }));
+    }
+
+    await closeBrowser(browser);
+  }
+
+  // ── Collect page data ──────────────────────────────────────────────────────
+  const pages = [
+    ...rawSuccess.filter(r => r.pageData).map(r => r.pageData),
+    ...renderSuccess.filter(r => r.pageData).map(r => r.pageData),
+  ];
+
+  // ── Build fetch log ────────────────────────────────────────────────────────
+  const fetchLog = [
+    ...rawSuccess.map(r => ({
+      url: r.url, success: true,
+      status: 'success:raw', message: r.message,
+    })),
+    ...rawFailed.map(r => ({
+      url: r.url, success: false,
+      status: r.status, message: r.message,
+    })),
+    ...needsRender.map(r => ({
+      url: r.url, success: false,
+      status: 'js-detected', message: `⟳ JS-rendered page detected — sending to renderer`,
+    })),
+    ...renderSuccess.map(r => ({
+      url: r.url, success: true,
+      status: 'success:rendered', message: r.message,
+    })),
+    ...renderFailed.map(r => ({
+      url: r.url, success: false,
+      status: r.status, message: r.message,
+    })),
+    ...renderNoBody.map(r => ({
+      url: r.url, success: false,
+      status: 'no-body-content', message: r.message,
+    })),
+  ];
+
+  // ── Cross-page boilerplate fingerprinting ─────────────────────────────────
   let boilerplateRemovedCount = 0;
   if (pages.length >= 3) {
     const bpSet = findCrossPageBoilerplate(pages);
     if (bpSet.size > 0) {
       pages.forEach(p => {
         const before = p.paragraphs.length;
-
-        // Filter out boilerplate, keeping positions in sync
         const kept = p.paragraphs.reduce((acc, text, i) => {
           if (!bpSet.has(text)) acc.push({ text, pos: p.paragraphPositions?.[i] ?? 0.5 });
           return acc;
         }, []);
-
         p.paragraphs         = kept.map(k => k.text);
         p.paragraphCount     = p.paragraphs.length;
-
-        // Recompute relative positions after filtering
         const total = p.paragraphs.length;
         p.paragraphPositions = p.paragraphs.map((_, i) =>
           total <= 1 ? 0 : parseFloat((i / (total - 1)).toFixed(3))
         );
-
         boilerplateRemovedCount += before - p.paragraphs.length;
       });
     }
   }
 
-  // ── Compute inbound link counts (from existing on-page links) ─────────────
+  // ── Inbound link counts ────────────────────────────────────────────────────
   const normSet    = new Set(pages.map(p => p.normalizedURL));
   const inboundMap = {};
   pages.forEach(p => { inboundMap[p.normalizedURL] = 0; });
@@ -259,132 +238,114 @@ export default async function handler(req, res) {
     p.isOrphan     = p.inboundCount === 0;
   });
 
-  // ── Discover opportunities ────────────────────────────────────────────────
+  // ── Analyze opportunities ──────────────────────────────────────────────────
   const opps    = pages.length >= 2 ? analyzeOpportunities(pages, settings) : [];
   const summary = buildSummary(fetchLog, pages, skipped, opps);
 
-  // Attach boilerplate removal info to summary for transparency
+  // ── Extended summary counters (v4.3) ──────────────────────────────────────
+  summary.rawFetched              = rawSuccess.length;
+  summary.jsDetected              = needsRender.length;
+  summary.rendered                = renderSuccess.length;
+  summary.renderFailed            = renderFailed.length;
+  summary.noBodyContent           = [
+    ...phase1.filter(r => r.noBody),
+    ...renderNoBody,
+  ].length;
+  summary.fetchFailed             = rawFailed.length;
   summary.boilerplateRemovedCount = boilerplateRemovedCount;
+  summary.playwrightAvailable     = browser !== null || needsRender.length === 0;
 
-  // ── Annotate pages with no outgoing opportunities ─────────────────────────
+  // ── Annotate pages with no opportunities ──────────────────────────────────
   const srcWithOpps = new Set(opps.map(o => normalizeURL(o.sourceURL)));
   pages.forEach(p => {
-    if (!srcWithOpps.has(p.normalizedURL)) {
+    if (!srcWithOpps.has(p.normalizedURL))
       p.noOpportunityReason = diagnoseNoOpportunity(p, pages, opps, settings);
-    }
   });
 
-  return res.status(200).json({
-    fetchLog,
-    pages,
-    skipped,
-    opportunities: opps,
-    summary,
-  });
+  return res.status(200).json({ fetchLog, pages, skipped, opportunities: opps, summary });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  FETCH + PARSE A SINGLE URL
+//  PHASE 1 — Raw fetch + detect JS rendering
 // ─────────────────────────────────────────────────────────────────────────────
-async function fetchAndProcess(url, settings = {}) {
+async function rawFetchAndProcess(url, settings) {
   const fetchResult = await fetchURL(url);
 
-  if (!fetchResult.success) {
+  if (!fetchResult.success)
+    return { url, success: false, status: fetchResult.status, message: fetchResult.message };
+
+  const html = fetchResult.html;
+
+  // ── Detect JS-rendered page ───────────────────────────────────────────────
+  if (isJSRendered(html)) {
+    return { url, jsDetected: true, success: false, status: 'js-detected' };
+  }
+
+  // ── Process raw HTML ──────────────────────────────────────────────────────
+  return processHTML(url, html, settings, false);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  PHASE 2 — Playwright render + process
+// ─────────────────────────────────────────────────────────────────────────────
+async function renderAndProcess(url, settings, browser) {
+  const result = await renderWithBrowser(browser, url, { timeout: RENDER_TIMEOUT_MS });
+
+  if (!result.success) {
     return {
-      url,
-      success: false,
-      status:  fetchResult.status,
-      message: fetchResult.message,
+      url, success: false,
+      status:  result.status,
+      message: result.status === 'failed:render-timeout'
+        ? `✗ Failed: render timeout after ${RENDER_TIMEOUT_MS / 1000}s`
+        : result.status === 'failed:render-unavailable'
+        ? `✗ Failed: render unavailable — ${result.error}`
+        : `✗ Failed: render error — ${result.error}`,
     };
   }
 
-  let html = fetchResult.html;
-  let jinaFallback = false;
+  return processHTML(url, result.html, settings, true);
+}
 
-  // ── JS-render detection + Jina fallback ──────────────────────────────────
-  // Strip script/style blocks and all tags, then count visible words.
-  // < 150 visible words means the page is almost certainly client-side
-  // rendered — the server only sent a React/Next.js shell.
-  const visibleWords = html
-    .replace(/<script[\s\S]*?<\/script>/gi, '')
-    .replace(/<style[\s\S]*?<\/style>/gi, '')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .split(/\s+/)
-    .filter(w => w.length > 1).length;
-
-  if (visibleWords < 150) {
-    const jinaHtml = await fetchViaJina(url);
-    if (jinaHtml) {
-      html = jinaHtml;
-      jinaFallback = true;
-    } else {
-      return {
-        url,
-        success: false,
-        status:  'skipped:js-rendered',
-        message: `⊘ Skipped: JavaScript-rendered page (~${visibleWords} visible words in raw HTML). Jina Reader fallback also failed.`,
-        skipped: {
-          url,
-          reason:  'js-rendered',
-          details: `Only ~${visibleWords} visible words in server-sent HTML. Content requires JavaScript execution.`,
-        },
-      };
-    }
-  }
-
-  // ── Parse with Cheerio ────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+//  SHARED HTML PROCESSING  (used by both phases)
+// ─────────────────────────────────────────────────────────────────────────────
+function processHTML(url, html, settings, isRendered) {
   const $ = cheerio.load(html, { decodeEntities: true });
 
-  // ── Check noindex ─────────────────────────────────────────────────────────
+  // ── noindex check ─────────────────────────────────────────────────────────
   const robotsMeta = ($('meta[name="robots"]').attr('content') || '').toLowerCase();
   if (robotsMeta.includes('noindex')) {
     return {
-      url,
-      success: false,
-      status:  'skipped:noindex',
-      message: '⊘ Skipped: noindex meta tag found — search engines ignore this page',
-      skipped: {
-        url,
-        reason:  'noindex',
-        details: 'Page has <meta name="robots" content="noindex">',
-      },
+      url, success: false, status: 'skipped:noindex',
+      message: '⊘ Skipped: noindex meta tag',
+      skipped: true,
+      skippedObj: { url, reason: 'noindex', details: 'Page has <meta name="robots" content="noindex">' },
     };
   }
 
-  // ── Check canonical ───────────────────────────────────────────────────────
+  // ── canonical check ───────────────────────────────────────────────────────
   const canonical = $('link[rel="canonical"]').attr('href');
   if (canonical) {
     try {
-      const canonNorm = normalizeURL(canonical);
-      const selfNorm  = normalizeURL(url);
-      if (canonNorm !== selfNorm && canonical !== url) {
+      if (normalizeURL(canonical) !== normalizeURL(url) && canonical !== url) {
         return {
-          url,
-          success:      false,
-          status:       'skipped:canonical',
-          message:      `⊘ Skipped: canonicalized to ${canonical}`,
-          redirectedTo: canonical,
-          skipped: {
-            url,
-            reason:  'canonical',
-            details: `Canonical points to: ${canonical}`,
-          },
+          url, success: false, status: 'skipped:canonical',
+          message: `⊘ Skipped: canonicalized to ${canonical}`,
+          skipped: true,
+          skippedObj: { url, reason: 'canonical', details: `Canonical: ${canonical}` },
         };
       }
     } catch {}
   }
 
-  // ── Extract meta ───────────────────────────────────────────────────────────
+  // ── Extract meta ──────────────────────────────────────────────────────────
   const title    = ($('title').text() || '').replace(/\s+/g, ' ').trim();
   const metaDesc = $('meta[name="description"]').attr('content')
                 || $('meta[property="og:description"]').attr('content')
                 || '';
   const h1       = ($('h1').first().text() || '').replace(/\s+/g, ' ').trim();
 
-  // ── Extract main body content (paragraphs + positions) ────────────────────
-  // extractMainContent now also returns `paragraphPositions` (0–1 per paragraph)
+  // ── Extract main body content ─────────────────────────────────────────────
   const {
     paragraphs,
     paragraphPositions,
@@ -397,28 +358,16 @@ async function fetchAndProcess(url, settings = {}) {
     extraIncludeSelectors: settings.includeSelectors  || '',
   });
 
-  // ── Check content thinness ────────────────────────────────────────────────
+  // ── No valid body content ─────────────────────────────────────────────────
   if (paragraphs.length < 1) {
-    const rawBodyText = ($('body').text() || '').replace(/\s+/g, ' ').trim();
-    const isJSRendered = rawBodyText.split(/\s+/).length < 80;
     return {
-      url,
-      success: false,
-      status:  isJSRendered ? 'skipped:js-rendered' : 'skipped:thin-content',
-      message: isJSRendered
-        ? `⊘ Skipped: page appears JavaScript-rendered (~${rawBodyText.split(/\s+/).length} words in raw HTML). Content loads via JS and cannot be extracted server-side.`
-        : `⊘ Skipped: only ${paragraphs.length} body paragraph(s) found — content too thin or extraction failed`,
-      skipped: {
-        url,
-        reason:  isJSRendered ? 'js-rendered' : 'thin-content',
-        details: isJSRendered
-          ? `Raw HTML body has ~${rawBodyText.split(/\s+/).length} words — client-side rendered app. Extraction: "${extractionMethod}" (${Math.round(confidence * 100)}% confidence).`
-          : `Extracted ${paragraphs.length} paragraphs via "${extractionMethod}" (confidence ${Math.round(confidence * 100)}%)`,
-      },
+      url, success: false, noBody: true,
+      status:  isRendered ? 'no-body-content:rendered' : 'no-body-content:raw',
+      message: `⊘ No valid body paragraph found after ${isRendered ? 'rendered' : 'raw'} extraction via "${extractionMethod}". No title/meta/heading fallback applied.`,
     };
   }
 
-  // ── Extract internal links from the full page ─────────────────────────────
+  // ── Internal links ────────────────────────────────────────────────────────
   const baseHost = new URL(url).hostname.replace(/^www\./, '');
   const existingLinkSet = new Set();
   $('a[href]').each((_, el) => {
@@ -431,46 +380,40 @@ async function fetchAndProcess(url, settings = {}) {
     } catch {}
   });
 
-  // ── Build keywords and topics ─────────────────────────────────────────────
   const fullText = [title, metaDesc, h1, ...headings.map(h => h.text), ...paragraphs].join(' ');
   const keywords = extractKeywords(fullText);
   const topics   = extractTopics(title, h1, headings, metaDesc);
   const pageType = detectPageType(url, title);
 
-  const pageData = {
-    url,
-    normalizedURL:       normalizeURL(url),
-    title:               title || url,
-    metaDesc,
-    h1,
-    headings,
-    paragraphs,
-    paragraphPositions,
-    existingLinks:       [...existingLinkSet],
-    keywords,
-    topics,
-    pageType,
-    extractionMethod,
-    confidence,
-    wordCount:           fullText.split(/\s+/).length,
-    paragraphCount:      paragraphs.length,
-    sourceType:          'main-body',  // v4: real body content only
-    inboundCount:        0,
-    isOrphan:            false,
-    error:               false,
-  };
-
   return {
     url,
     success: true,
-    status:  'success',
-    message: `✓ Fetched${jinaFallback ? ' via Jina Reader (JS-rendered)' : ''} — ${paragraphs.length} body paragraphs via "${extractionMethod}" (${Math.round(confidence * 100)}% confidence)`,
-    pageData,
+    status:  isRendered ? 'success:rendered' : 'success:raw',
+    message: `✓ ${isRendered ? 'Successfully analyzed: rendered HTML' : 'Successfully analyzed: raw HTML'} — ${paragraphs.length} body paragraph(s) via "${extractionMethod}" (${Math.round(confidence * 100)}% confidence)`,
+    pageData: {
+      url,
+      normalizedURL:       normalizeURL(url),
+      title:               title || url,
+      metaDesc, h1, headings,
+      paragraphs,
+      paragraphPositions,
+      existingLinks:       [...existingLinkSet],
+      keywords, topics, pageType,
+      extractionMethod:    isRendered ? `${extractionMethod} [rendered]` : extractionMethod,
+      confidence,
+      wordCount:           fullText.split(/\s+/).length,
+      paragraphCount:      paragraphs.length,
+      sourceType:          'main-body',
+      renderMethod:        isRendered ? 'playwright' : 'raw',
+      inboundCount:        0,
+      isOrphan:            false,
+      error:               false,
+    },
   };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  RAW HTTP FETCH  (v4: 30s timeout, retry once on timeout/network error)
+//  RAW HTTP FETCH  (30 s timeout, retry once)
 // ─────────────────────────────────────────────────────────────────────────────
 async function fetchURL(url, attempt = 0) {
   const controller = new AbortController();
@@ -483,27 +426,16 @@ async function fetchURL(url, attempt = 0) {
     const ct = (res.headers.get('content-type') || '').toLowerCase();
 
     if (!res.ok) {
-      const statusMap = {
-        403: 'Access forbidden — server blocked the request',
-        404: 'Page not found (404)',
-        429: 'Rate limited — too many requests',
-        500: 'Server error (500)',
-        503: 'Service unavailable (503)',
-      };
-      return { success: false, status: `failed:http-${res.status}`, message: `✗ Failed: ${statusMap[res.status] || `HTTP ${res.status}`}` };
+      const m = { 403:'Access forbidden', 404:'Not found', 429:'Rate limited', 500:'Server error', 503:'Service unavailable' };
+      return { success: false, status: `failed:http-${res.status}`, message: `✗ Failed: ${m[res.status] || `HTTP ${res.status}`}` };
     }
-
     if (!ct.includes('html') && !ct.includes('text')) {
-      return {
-        success: false, status: 'skipped:non-html',
-        message: `⊘ Skipped: non-HTML response (Content-Type: ${ct})`,
-        skipped: { url, reason: 'non-html', details: `Content-Type was "${ct}"` },
-      };
+      return { success: false, status: 'skipped:non-html', message: `⊘ Skipped: non-HTML response (${ct})` };
     }
 
     const html = await res.text();
-    if (!html || html.trim().length < 300)
-      return { success: false, status: 'failed:empty-response', message: '✗ Failed: Response body too short or empty' };
+    if (!html || html.trim().length < 100)
+      return { success: false, status: 'failed:empty', message: '✗ Failed: Empty response' };
 
     return { success: true, html };
 
@@ -514,22 +446,22 @@ async function fetchURL(url, attempt = 0) {
       await new Promise(r => setTimeout(r, 1500));
       return fetchURL(url, attempt + 1);
     }
-    if (err.name === 'AbortError')       return { success: false, status: 'failed:timeout',  message: `✗ Failed: Timeout after ${FETCH_TIMEOUT_MS / 1000}s` };
-    if (err.code === 'ECONNREFUSED')     return { success: false, status: 'failed:refused',  message: '✗ Failed: Connection refused' };
-    if (err.code === 'ENOTFOUND')        return { success: false, status: 'failed:dns',      message: '✗ Failed: Domain not found (DNS lookup failed)' };
-    if (err.code === 'CERT_HAS_EXPIRED') return { success: false, status: 'failed:ssl',      message: '✗ Failed: SSL certificate error' };
+    if (err.name === 'AbortError')       return { success: false, status: 'failed:raw-fetch-timeout', message: `✗ Failed: Raw fetch timeout after ${FETCH_TIMEOUT_MS / 1000}s` };
+    if (err.code === 'ECONNREFUSED')     return { success: false, status: 'failed:refused',           message: '✗ Failed: Connection refused' };
+    if (err.code === 'ENOTFOUND')        return { success: false, status: 'failed:dns',               message: '✗ Failed: Domain not found' };
+    if (err.code === 'CERT_HAS_EXPIRED') return { success: false, status: 'failed:ssl',               message: '✗ Failed: SSL certificate error' };
     return { success: false, status: 'failed:error', message: `✗ Failed: ${err.message}` };
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  EXPLAIN WHY A PAGE HAS NO OPPORTUNITIES
+//  DIAGNOSE WHY A PAGE HAS NO OPPORTUNITIES
 // ─────────────────────────────────────────────────────────────────────────────
 function diagnoseNoOpportunity(page, allPages, opps, settings) {
   const minScore = settings.minScore || 3;
 
-  if (page.paragraphs.length < 2)
-    return 'Content too thin — fewer than 2 body paragraphs extracted';
+  if (page.paragraphs.length < 1)
+    return 'No valid body paragraphs extracted from this page';
 
   const alreadyLinked = allPages.filter(
     t => t.normalizedURL !== page.normalizedURL && page.existingLinks.includes(t.normalizedURL)
@@ -537,13 +469,9 @@ function diagnoseNoOpportunity(page, allPages, opps, settings) {
   if (alreadyLinked.length === allPages.length - 1)
     return 'Already links to every other page in the set';
 
-  const hasAnySrc = opps.some(o => normalizeURL(o.sourceURL) === page.normalizedURL);
-  if (!hasAnySrc) {
-    const hasAnyTgt = opps.some(o => normalizeURL(o.targetURL) === page.normalizedURL);
-    if (!hasAnyTgt)
-      return `No natural anchor text found in body paragraphs that matches other pages' titles/headings (min score: ${minScore}/10)`;
-    return `No outgoing opportunities found (page may already link to all relevant targets, or keyword overlap below threshold)`;
-  }
+  const hasAnyTgt = opps.some(o => normalizeURL(o.targetURL) === page.normalizedURL);
+  if (!hasAnyTgt)
+    return `No natural anchor text found matching other pages' topics (min score: ${minScore}/10)`;
 
-  return `All suggestions fell below minimum score threshold (${minScore}/10)`;
+  return `All suggestions below minimum score threshold (${minScore}/10)`;
 }

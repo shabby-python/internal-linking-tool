@@ -534,18 +534,33 @@ function OrphanTab({ summary }) {
 //  FAILURES TAB
 // ─────────────────────────────────────────────────────────────────────────────
 function FailuresTab({ fetchLog, skipped }) {
-  const failures = fetchLog.filter(l => !l.success && !l.status?.startsWith('skipped'));
-  const skips    = [...skipped, ...fetchLog.filter(l => l.status?.startsWith('skipped'))];
+  // v4.3: separate actual fetch failures from render failures and no-body pages
+  const fetchFailures  = fetchLog.filter(l => !l.success && l.status?.startsWith('failed:'));
+  const renderFailures = fetchLog.filter(l => !l.success && (l.status === 'no-body-content' || l.status?.startsWith('no-body-content:')));
+  const skips          = [...skipped, ...fetchLog.filter(l => l.status?.startsWith('skipped:'))];
 
   return (
     <div style={{display:'grid',gap:20}}>
-      {failures.length > 0 && (
+      {fetchFailures.length > 0 && (
         <div>
-          <div style={{fontSize:11,fontWeight:700,textTransform:'uppercase',letterSpacing:'.6px',color:C.g400,marginBottom:10}}>Fetch Failures ({failures.length})</div>
+          <div style={{fontSize:11,fontWeight:700,textTransform:'uppercase',letterSpacing:'.6px',color:C.g400,marginBottom:10}}>Fetch Failures — Network / HTTP ({fetchFailures.length})</div>
           <div style={{display:'flex',flexDirection:'column',gap:7}}>
-            {failures.map((f,i)=>(
+            {fetchFailures.map((f,i)=>(
               <div key={i} style={{padding:'10px 14px',background:C.redL,border:`1px solid #fca5a5`,borderRadius:7,fontSize:12}}>
                 <div style={{fontWeight:700,color:C.red}}>{f.url}</div>
+                <div style={{color:C.g600,marginTop:2}}>{f.message}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      {renderFailures.length > 0 && (
+        <div>
+          <div style={{fontSize:11,fontWeight:700,textTransform:'uppercase',letterSpacing:'.6px',color:C.g400,marginBottom:10}}>No Valid Body Content ({renderFailures.length})</div>
+          <div style={{display:'flex',flexDirection:'column',gap:7}}>
+            {renderFailures.map((f,i)=>(
+              <div key={i} style={{padding:'10px 14px',background:C.orangeL,border:`1px solid #fde68a`,borderRadius:7,fontSize:12}}>
+                <div style={{fontWeight:700,color:C.orange}}>{f.url}</div>
                 <div style={{color:C.g600,marginTop:2}}>{f.message}</div>
               </div>
             ))}
@@ -938,7 +953,11 @@ export default function Home() {
   const allSources     = [...new Set(opps.map(o=>o.sourceURL))];
   const allTargets     = [...new Set(opps.map(o=>o.targetURL))];
   const allAnchorTypes = [...new Set(opps.map(o=>o.anchorType).filter(Boolean))];
-  const failures       = fetchLog.filter(l => !l.success);
+  // v4.3: separate real fetch failures from JS-rendered / no-body pages
+  const failures       = fetchLog.filter(l => !l.success && l.status?.startsWith('failed:'));
+  const jsRenderedCount = fetchLog.filter(l => l.status === 'js-detected').length;
+  const renderedCount   = summary?.rendered ?? fetchLog.filter(l => l.status === 'success:rendered').length;
+  const rawFetchedCount = summary?.rawFetched ?? fetchLog.filter(l => l.status === 'success:raw').length;
   const urlCount       = urlText.split('\n').filter(s=>s.trim().startsWith('http')).length;
   const hasFilters     = fType||fPriority||fSource||fTarget||fScore||fSearch||fPos||fAnchorType||fOrphanOnly;
 
@@ -1142,14 +1161,14 @@ export default function Home() {
           {/* RESULTS */}
           {hasResults && (
             <>
-              {/* STAT CARDS */}
+              {/* STAT CARDS — v4.3: accurate counters */}
               <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fit,minmax(145px,1fr))',gap:'0.8rem',marginBottom:'1.1rem'}}>
                 {[
-                  ['Total Opportunities', opps.length,                          'linking suggestions',   C.brand],
-                  ['High Priority',       opps.filter(o=>o.score>=8).length,    'score ≥ 8/10',          C.green],
-                  ['Pages Analyzed',      pages.length,                         'successfully fetched',  C.orange],
-                  ['Fetch Failures',      failures.length,                      'check failures tab',    C.red],
-                  ['Orphan Pages',        summary?.orphanPages?.length||0,      'no inbound links',      C.purple],
+                  ['Total Opportunities', opps.length,                       'linking suggestions',    C.brand],
+                  ['High Priority',       opps.filter(o=>o.score>=8).length, 'score ≥ 8/10',           C.green],
+                  ['Pages Analyzed',      pages.length,                      `${rawFetchedCount} raw · ${renderedCount} rendered`, C.orange],
+                  ['Fetch Failures',      failures.length,                   'network/HTTP errors only', C.red],
+                  ['Orphan Pages',        summary?.orphanPages?.length||0,   'no inbound links',       C.purple],
                 ].map(([label,val,sub,col])=>(
                   <div key={label} style={{background:'#fff',border:`1px solid ${C.g200}`,borderRadius:10,padding:'1rem',borderTop:`3px solid ${col}`}}>
                     <div style={{fontSize:9,fontWeight:700,textTransform:'uppercase',letterSpacing:'.6px',color:C.g400}}>{label}</div>
@@ -1157,6 +1176,13 @@ export default function Home() {
                     <div style={{fontSize:10,color:C.g500}}>{sub}</div>
                   </div>
                 ))}
+                {jsRenderedCount > 0 && (
+                  <div style={{background:'#fff',border:`1px solid ${C.g200}`,borderRadius:10,padding:'1rem',borderTop:`3px solid ${C.teal}`}}>
+                    <div style={{fontSize:9,fontWeight:700,textTransform:'uppercase',letterSpacing:'.6px',color:C.g400}}>JS Rendered</div>
+                    <div style={{fontSize:26,fontWeight:800,color:C.g900,margin:'3px 0'}}>{renderedCount}<span style={{fontSize:13,color:C.g400}}>/{jsRenderedCount}</span></div>
+                    <div style={{fontSize:10,color:C.g500}}>rendered successfully</div>
+                  </div>
+                )}
               </div>
 
               {/* MAIN CARD */}
