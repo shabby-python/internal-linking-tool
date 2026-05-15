@@ -69,6 +69,72 @@ async function concurrentMap(items, fn, concurrency = CONCURRENCY) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  JINA AI READER FALLBACK
+//  Used when server-fetched HTML has almost no visible text (JS-rendered pages).
+//  Jina Reader (r.jina.ai) renders the page and returns clean markdown — free,
+//  no API key required.
+// ─────────────────────────────────────────────────────────────────────────────
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+async function fetchViaJina(url) {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 22000);
+    const res = await fetch(`https://r.jina.ai/${url}`, {
+      signal: controller.signal,
+      headers: { 'Accept': 'text/plain', 'X-No-Cache': 'true' },
+    });
+    clearTimeout(timer);
+    if (!res.ok) return null;
+    const text = await res.text();
+    if (!text || text.trim().length < 150) return null;
+
+    const lines = text.split('\n').map(l => l.trim());
+    let title = '';
+    let inContent = false;
+    const body = [];
+
+    for (const line of lines) {
+      if (!line) continue;
+      if (line.startsWith('Title:'))          { title = line.slice(6).trim(); continue; }
+      if (line.startsWith('URL Source:') ||
+          line.startsWith('Published Time:') ||
+          line.startsWith('Warning:'))         { continue; }
+      if (line === 'Markdown Content:')        { inContent = true; continue; }
+      if (!inContent)                          { continue; }
+      if (line.startsWith('!') ||
+          line.startsWith('|'))               { continue; }
+
+      if (line.startsWith('# ')) {
+        body.push(`<h1>${escHtml(line.slice(2))}</h1>`);
+      } else if (/^#{2,6} /.test(line)) {
+        const m = line.match(/^(#{2,6}) (.*)/);
+        if (m) body.push(`<h${m[1].length}>${escHtml(m[2])}</h${m[1].length}>`);
+      } else {
+        const clean = line
+          .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+          .replace(/\*{1,3}([^*]+)\*{1,3}/g, '$1')
+          .replace(/`([^`]+)`/g, '$1')
+          .trim();
+        if (clean.length > 20) body.push(`<p>${escHtml(clean)}</p>`);
+      }
+    }
+
+    if (body.length < 3) return null;
+
+    return `<html><head><title>${escHtml(title)}</title></head>` +
+           `<body><main>${body.join('\n')}</main></body></html>`;
+  } catch {
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  MAIN HANDLER
 // ─────────────────────────────────────────────────────────────────────────────
 export default async function handler(req, res) {
@@ -500,7 +566,36 @@ async function fetchAndProcess(url, settings = {}, isTarget = false) {
   if (!fetchResult.success)
     return { url, success: false, status: fetchResult.status, message: fetchResult.message };
 
-  const html = fetchResult.html;
+  let html = fetchResult.html;
+  let jinaFallback = false;
+
+  // ── JS-render detection + Jina fallback ──────────────────────────────────
+  const visibleWords = html
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(/\s+/)
+    .filter(w => w.length > 1).length;
+
+  if (visibleWords < 150) {
+    const jinaHtml = await fetchViaJina(url);
+    if (jinaHtml) {
+      html = jinaHtml;
+      jinaFallback = true;
+    } else {
+      return {
+        url, success: false, status: 'skipped:js-rendered',
+        message: `⊘ Skipped: JavaScript-rendered page (~${visibleWords} visible words in raw HTML). Jina Reader fallback also failed.`,
+        skipped: {
+          url, reason: 'js-rendered',
+          details: `Only ~${visibleWords} visible words in raw HTML. Content requires JavaScript execution.`,
+        },
+      };
+    }
+  }
+
   const $    = cheerio.load(html, { decodeEntities: true });
 
   // noindex check (only for non-target pages)
@@ -589,7 +684,7 @@ async function fetchAndProcess(url, settings = {}, isTarget = false) {
     url,
     success: true,
     status:  'success',
-    message: `✓ Fetched — ${paragraphs.length} body paragraphs via "${extractionMethod}" (${Math.round(confidence * 100)}% confidence)`,
+    message: `✓ Fetched${jinaFallback ? ' via Jina Reader (JS-rendered)' : ''} — ${paragraphs.length} body paragraphs via "${extractionMethod}" (${Math.round(confidence * 100)}% confidence)`,
     pageData: {
       url,
       normalizedURL:       normalizeURL(url),
