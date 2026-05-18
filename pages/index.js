@@ -986,7 +986,7 @@ export default function Home() {
         <header style={{background:'#fff',borderBottom:`1px solid ${C.g200}`,padding:'0 2rem',display:'flex',alignItems:'center',height:56,gap:12,position:'sticky',top:0,zIndex:100,boxShadow:'0 1px 4px rgba(0,0,0,.06)'}}>
           <div style={{width:28,height:28,borderRadius:7,background:C.brand,display:'flex',alignItems:'center',justifyContent:'center',color:'#fff',fontWeight:800,fontSize:12}}>IL</div>
           <span style={{fontSize:14,fontWeight:700,color:C.g900}}>Internal Linking Opportunity Finder</span>
-          <span style={{fontSize:11,color:C.g400,marginLeft:2}}>v3 · Any website · Body content only</span>
+          <span style={{fontSize:11,color:C.g400,marginLeft:2}}>v4.4 · Any website · Body content only</span>
         </header>
 
         <main style={{maxWidth:1160,margin:'0 auto',padding:'1.6rem 1.5rem'}}>
